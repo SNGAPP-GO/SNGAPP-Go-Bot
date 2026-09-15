@@ -5,6 +5,123 @@ import re
 
 SNGAPP_URL = "https://t.me/sngapp_bot/app"
 
+# Нормализация частых городов и падежных форм.
+# Список можно постепенно расширять по реальным объявлениям.
+CITY_ALIASES = {
+    "оренбург": "Оренбург",
+    "оренбурга": "Оренбург",
+    "оренбурге": "Оренбург",
+
+    "орск": "Орск",
+    "орска": "Орск",
+    "орске": "Орск",
+
+    "казань": "Казань",
+    "казани": "Казань",
+
+    "чебоксары": "Чебоксары",
+    "чебоксар": "Чебоксары",
+    "чебоксарах": "Чебоксары",
+
+    "краснодар": "Краснодар",
+    "краснодара": "Краснодар",
+    "краснодаре": "Краснодар",
+
+    "сочи": "Сочи",
+
+    "симферополь": "Симферополь",
+    "симферополя": "Симферополь",
+    "симферополе": "Симферополь",
+
+    "севастополь": "Севастополь",
+    "севастополя": "Севастополь",
+    "севастополе": "Севастополь",
+
+    "ялта": "Ялта",
+    "ялты": "Ялта",
+    "ялте": "Ялта",
+
+    "керчь": "Керчь",
+    "керчи": "Керчь",
+
+    "феодосия": "Феодосия",
+    "феодосии": "Феодосия",
+
+    "судак": "Судак",
+    "судака": "Судак",
+    "судаке": "Судак",
+
+    "джанкой": "Джанкой",
+    "джанкоя": "Джанкой",
+
+    "москва": "Москва",
+    "москвы": "Москва",
+    "москве": "Москва",
+
+    "уфа": "Уфа",
+    "уфы": "Уфа",
+    "уфе": "Уфа",
+
+    "нижний новгород": "Нижний Новгород",
+    "нижнего новгорода": "Нижний Новгород",
+
+    "владимир": "Владимир",
+    "владимира": "Владимир",
+
+    "елабуга": "Елабуга",
+    "елабуги": "Елабуга",
+
+    "набережные челны": "Набережные Челны",
+    "набережных челнов": "Набережные Челны",
+    "н.челны": "Набережные Челны",
+    "н челны": "Набережные Челны",
+
+    "курган": "Курган",
+    "кургана": "Курган",
+
+    "тюмень": "Тюмень",
+    "тюмени": "Тюмень",
+
+    "челябинск": "Челябинск",
+    "челябинска": "Челябинск",
+
+    "екатеринбург": "Екатеринбург",
+    "екатеринбурга": "Екатеринбург",
+
+    "владивосток": "Владивосток",
+    "владивостока": "Владивосток",
+
+    "уссурийск": "Уссурийск",
+    "уссурийска": "Уссурийск",
+
+    "находка": "Находка",
+    "находки": "Находка",
+
+    "арсеньев": "Арсеньев",
+    "арсеньева": "Арсеньев",
+
+    "большой камень": "Большой Камень",
+    "большого камня": "Большой Камень",
+
+    "ростов-на-дону": "Ростов-на-Дону",
+    "ростова-на-дону": "Ростов-на-Дону",
+    "ростов на дону": "Ростов-на-Дону",
+    "ростова на дону": "Ростов-на-Дону",
+
+    "майкоп": "Майкоп",
+    "майкопа": "Майкоп",
+
+    "пятигорск": "Пятигорск",
+    "пятигорска": "Пятигорск",
+
+    "минеральные воды": "Минеральные Воды",
+    "минводы": "Минеральные Воды",
+    "минвод": "Минеральные Воды",
+
+    "астрахань": "Астрахань",
+    "астрахани": "Астрахань",
+}
+
 
 def main_menu():
     return InlineKeyboardMarkup([
@@ -23,6 +140,18 @@ def normalize_text(text: str) -> str:
     text = text.replace("—", "-").replace("–", "-")
     text = re.sub(r"[ \t]+", " ", text)
     return text.strip()
+
+
+def normalize_city(value: str) -> str:
+    value = value.strip(" ,.;:")
+    value = re.sub(r"\s+", " ", value)
+    key = value.lower()
+
+    if key in CITY_ALIASES:
+        return CITY_ALIASES[key]
+
+    # Если точного варианта пока нет — хотя бы аккуратно приводим регистр.
+    return " ".join(word.capitalize() for word in value.split())
 
 
 def detect_type(text: str) -> str:
@@ -57,13 +186,15 @@ def extract_phone(text: str) -> str:
 
 
 def extract_times(text: str) -> list[str]:
-    # Время вида 9.30 / 09:30, но не часть даты.
     found = re.findall(r'(?<!\d)(?:[01]?\d|2[0-3])[:.][0-5]\d(?!\d)', text)
     result = []
+
     for item in found:
-        normalized = item.replace(".", ":")
+        hour, minute = re.split(r'[:.]', item)
+        normalized = f"{int(hour):02d}:{minute}"
         if normalized not in result:
             result.append(normalized)
+
     return result[:8]
 
 
@@ -75,7 +206,6 @@ def extract_dates(text: str) -> list[str]:
         if re.search(rf'\b{word}\b', t):
             result.append(word)
 
-    # Дата 14.09 / 14. 09 / 14.09.2026 / 14/09
     for m in re.finditer(
         r'(?<!\d)(\d{1,2})\s*[./]\s*(\d{1,2})(?:\s*[./]\s*(\d{2,4}))?(?!\d)',
         text
@@ -83,7 +213,7 @@ def extract_dates(text: str) -> list[str]:
         day = int(m.group(1))
         month = int(m.group(2))
 
-        # Не принимаем 9.30 или 13.30 за дату.
+        # Не принимаем 09.30 / 13.30 за дату.
         if not (1 <= day <= 31 and 1 <= month <= 12):
             continue
 
@@ -131,12 +261,6 @@ def extract_price(text: str) -> str:
     return "—"
 
 
-def clean_city(value: str) -> str:
-    value = value.strip(" ,.;:")
-    value = re.sub(r'\s+', ' ', value)
-    return value
-
-
 def extract_routes(text: str) -> list[str]:
     t = normalize_text(text)
     routes = []
@@ -144,40 +268,29 @@ def extract_routes(text: str) -> list[str]:
     # "с Оренбурга в Орск"
     # "из Краснодара в Крым"
     for m in re.finditer(
-        r'\b(?:с|из)\s+([А-ЯЁA-Z][А-Яа-яЁёA-Za-z\- ]{2,30}?)\s+в\s+'
-        r'([А-ЯЁA-Z][А-Яа-яЁёA-Za-z\- ]{2,30}?)(?=\s+в\s+\d{1,2}[.:]\d{2}|[,.;\n]|$)',
+        r'\b(?:с|из)\s+([А-ЯЁA-Z][А-Яа-яЁёA-Za-z.\- ]{1,35}?)\s+в\s+'
+        r'([А-ЯЁA-Z][А-Яа-яЁёA-Za-z.\- ]{1,35}?)(?=\s+в\s+\d{1,2}[.:]\d{2}|[,.;\n]|$)',
         t,
         flags=re.IGNORECASE
     ):
-        origin = clean_city(m.group(1))
-        destination = clean_city(m.group(2))
-        route = f"{origin} → {destination}"
+        origin = normalize_city(m.group(1))
+        destination = normalize_city(m.group(2))
+
+        route = f"{origin.upper()} → {destination.upper()}"
         if route not in routes:
             routes.append(route)
 
-    # "обратно с Орска в Оренбург"
-    for m in re.finditer(
-        r'\bобратно\s+(?:с|из)\s+([А-ЯЁA-Z][А-Яа-яЁёA-Za-z\- ]{2,30}?)\s+в\s+'
-        r'([А-ЯЁA-Z][А-Яа-яЁёA-Za-z\- ]{2,30}?)(?=\s+в\s+\d{1,2}[.:]\d{2}|[,.;\n]|$)',
-        t,
-        flags=re.IGNORECASE
-    ):
-        origin = clean_city(m.group(1))
-        destination = clean_city(m.group(2))
-        route = f"{origin} → {destination}"
-        if route not in routes:
-            routes.append(route)
-
-    # "Казань - Чебоксары" / "Казань → Чебоксары"
+    # Формат "Казань - Чебоксары" / "Казань → Чебоксары"
     if not routes:
         for m in re.finditer(
-            r'([А-ЯЁA-Z][А-Яа-яЁёA-Za-z.\- ]{1,30}?)\s*(?:→|->|=>|\s-\s)\s*'
-            r'([А-ЯЁA-Z][А-Яа-яЁёA-Za-z.\- ]{1,30})(?=[,.;\n]|$)',
+            r'([А-ЯЁA-Z][А-Яа-яЁёA-Za-z.\- ]{1,35}?)\s*(?:→|->|=>|\s-\s)\s*'
+            r'([А-ЯЁA-Z][А-Яа-яЁёA-Za-z.\- ]{1,35})(?=[,.;\n]|$)',
             t
         ):
-            origin = clean_city(m.group(1))
-            destination = clean_city(m.group(2))
-            route = f"{origin} → {destination}"
+            origin = normalize_city(m.group(1))
+            destination = normalize_city(m.group(2))
+
+            route = f"{origin.upper()} → {destination.upper()}"
             if route not in routes:
                 routes.append(route)
 
@@ -194,6 +307,7 @@ def format_route_time_pairs(routes: list[str], times: list[str]) -> str:
             lines.append(f"{route} — {times[i]}")
         else:
             lines.append(route)
+
     return "\n".join(lines)
 
 
@@ -261,6 +375,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def parse_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or update.message.caption or ""
+
     if not text:
         await update.message.reply_text("Не вижу текста объявления.")
         return
