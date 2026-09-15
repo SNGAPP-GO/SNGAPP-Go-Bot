@@ -5,7 +5,6 @@ import re
 
 SNGAPP_URL = "https://t.me/sngapp_bot/app"
 
-# Нормализация частых городов и падежных форм.
 CITY_ALIASES = {
     "оренбург": "Оренбург", "оренбурга": "Оренбург", "оренбурге": "Оренбург",
     "орск": "Орск", "орска": "Орск", "орске": "Орск",
@@ -88,11 +87,16 @@ def detect_type(text: str) -> str:
     ]
     passenger_markers = [
         "#пассажир", "ищу машину", "ищем машину", "кто едет",
-        "нужно уехать", "ищу попутку", "пассажир"
+        "нужно уехать", "ищу попутку", "пассажир",
+        "кто-нибудь едет", "кто нибудь едет"
     ]
 
     driver_score = sum(marker in t for marker in driver_markers)
     passenger_score = sum(marker in t for marker in passenger_markers)
+
+    # Более гибкая форма: "кто нибудь/кто-нибудь едет"
+    if re.search(r'\bкто(?:\s+|-)?(?:нибудь\s+)?едет\b', t):
+        passenger_score += 2
 
     if driver_score > passenger_score and driver_score > 0:
         return "🚗 Водитель"
@@ -109,13 +113,51 @@ def extract_phone(text: str) -> str:
     return ", ".join(found[:3]) if found else "—"
 
 
+def date_spans(text: str):
+    spans = []
+
+    # Полная дата с годом: 22.09.23 / 22,09,23 / 22/09/2026
+    for m in re.finditer(
+        r'(?<!\d)(\d{1,2})\s*([./,])\s*(\d{1,2})\s*\2\s*(\d{2,4})(?!\d)',
+        text
+    ):
+        day = int(m.group(1))
+        month = int(m.group(3))
+        if 1 <= day <= 31 and 1 <= month <= 12:
+            spans.append((m.start(), m.end()))
+
+    # Короткая дата без года: считаем датой, если она стоит в начале текста/строки
+    # или перед ней явно написано "дата".
+    for m in re.finditer(
+        r'(?<!\d)(\d{1,2})\s*([./])\s*(\d{1,2})(?![\d./])',
+        text
+    ):
+        day = int(m.group(1))
+        month = int(m.group(3))
+        if not (1 <= day <= 31 and 1 <= month <= 12):
+            continue
+
+        prefix = text[max(0, m.start()-8):m.start()].lower()
+        at_line_start = m.start() == 0 or text[m.start()-1] == "\n"
+        if at_line_start or "дата" in prefix:
+            spans.append((m.start(), m.end()))
+
+    return spans
+
+
 def extract_times(text: str) -> list[str]:
-    found = re.findall(r'(?<!\d)(?:[01]?\d|2[0-3])[:.][0-5]\d(?!\d)', text)
+    spans = date_spans(text)
     result = []
 
-    for item in found:
+    for m in re.finditer(r'(?<!\d)(?:[01]?\d|2[0-3])[:.][0-5]\d(?!\d)', text):
+        # Не принимаем дату вроде 17.09 за время.
+        if any(m.start() < end and m.end() > start for start, end in spans):
+            continue
+
+        item = m.group(0)
         hour, minute = re.split(r'[:.]', item)
         normalized = f"{int(hour):02d}:{minute}"
+
         if normalized not in result:
             result.append(normalized)
 
@@ -130,9 +172,23 @@ def extract_dates(text: str) -> list[str]:
         if re.search(rf'\b{word}\b', t):
             result.append(word)
 
-    # Поддержка 22.09.23, 22/09/23, 22,09,23 и 22.09
+    # Полная дата с годом.
     for m in re.finditer(
-        r'(?<!\d)(\d{1,2})\s*([./,])\s*(\d{1,2})(?:\s*\2\s*(\d{2,4}))?(?!\d)',
+        r'(?<!\d)(\d{1,2})\s*([./,])\s*(\d{1,2})\s*\2\s*(\d{2,4})(?!\d)',
+        text
+    ):
+        day = int(m.group(1))
+        month = int(m.group(3))
+        year = m.group(4)
+
+        if 1 <= day <= 31 and 1 <= month <= 12:
+            value = f"{day:02d}.{month:02d}.{year}"
+            if value not in result:
+                result.append(value)
+
+    # Короткая дата без года — в начале текста/строки или после слова "дата".
+    for m in re.finditer(
+        r'(?<!\d)(\d{1,2})\s*([./])\s*(\d{1,2})(?![\d./])',
         text
     ):
         day = int(m.group(1))
@@ -141,19 +197,18 @@ def extract_dates(text: str) -> list[str]:
         if not (1 <= day <= 31 and 1 <= month <= 12):
             continue
 
-        year = m.group(4)
-        value = f"{day:02d}.{month:02d}"
-        if year:
-            value += f".{year}"
+        prefix = text[max(0, m.start()-8):m.start()].lower()
+        at_line_start = m.start() == 0 or text[m.start()-1] == "\n"
 
-        if value not in result:
-            result.append(value)
+        if at_line_start or "дата" in prefix:
+            value = f"{day:02d}.{month:02d}"
+            if value not in result:
+                result.append(value)
 
     return result
 
 
 def extract_seats(text: str) -> str:
-    # Сначала цифры
     patterns = [
         r'(\d+)\s*(?:места|мест|место)\b',
         r'возьму\s*(\d+)(?:\s*-\s*(\d+))?\s*(?:попутчиков|пассажиров)?',
@@ -164,12 +219,10 @@ def extract_seats(text: str) -> str:
         m = re.search(pattern, text, flags=re.IGNORECASE)
         if not m:
             continue
-
         if len(m.groups()) >= 2 and m.group(2):
             return f"{m.group(1)}–{m.group(2)}"
         return m.group(1)
 
-    # Потом числа словами: "есть два места", "три места"
     words = "|".join(NUMBER_WORDS.keys())
     m = re.search(
         rf'\b(?:есть\s+)?({words})\s+(?:места|мест|место)\b',
@@ -187,28 +240,23 @@ def extract_price(text: str) -> str:
         r'(?<!\d)(\d{2,5})\s*(?:₽|руб(?:лей|ля|\.|)?|р\b)',
         r'\bпо\s*(\d{2,5})\s*(?:₽|р|руб)?\b',
     ]
-
     for pattern in patterns:
         m = re.search(pattern, text, flags=re.IGNORECASE)
         if m:
             return f"{m.group(1)} ₽"
-
     return "—"
 
 
 def find_known_cities(text: str):
-    """Ищет известные города в тексте и возвращает их по порядку появления."""
     lower = text.lower()
     matches = []
 
-    # Более длинные варианты ищем первыми.
     for alias in sorted(CITY_ALIASES.keys(), key=len, reverse=True):
         for m in re.finditer(rf'(?<![а-яёa-z]){re.escape(alias)}(?![а-яёa-z])', lower):
-            canonical = CITY_ALIASES[alias]
-            matches.append((m.start(), m.end(), canonical))
+            matches.append((m.start(), m.end(), CITY_ALIASES[alias]))
 
-    # Удаляем перекрывающиеся совпадения, оставляя более длинное.
     matches.sort(key=lambda x: (x[0], -(x[1] - x[0])))
+
     filtered = []
     last_end = -1
     for item in matches:
@@ -223,7 +271,7 @@ def extract_routes(text: str) -> list[str]:
     t = normalize_text(text)
     routes = []
 
-    # 1) Формы "с Оренбурга в Орск", "из Краснодара в Крым"
+    # "с Оренбурга в Орск" / "из Краснодара в Крым"
     for m in re.finditer(
         r'\b(?:с|из)\s+([А-ЯЁA-Z][А-Яа-яЁёA-Za-z.\- ]{1,35}?)\s+в\s+'
         r'([А-ЯЁA-Z][А-Яа-яЁёA-Za-z.\- ]{1,35}?)(?=\s+в\s+\d{1,2}[.:]\d{2}|[,.;\n]|$)',
@@ -236,8 +284,7 @@ def extract_routes(text: str) -> list[str]:
         if route not in routes:
             routes.append(route)
 
-    # 2) Формы "Казань-Оренбург", "Казань - Оренбург", "Казань → Оренбург"
-    # Надёжнее распознаём их через словарь известных городов.
+    # "Казань-Оренбург", "Оренбург-Орск", "Казань → Чебоксары"
     if not routes:
         cities = find_known_cities(t)
         for i in range(len(cities) - 1):
@@ -245,24 +292,10 @@ def extract_routes(text: str) -> list[str]:
             b = cities[i + 1]
             between = t[a[1]:b[0]]
 
-            # Между двумя городами должен быть явный разделитель маршрута.
             if re.fullmatch(r'\s*(?:-|→|->|=>)\s*', between):
                 route = f"{a[2].upper()} → {b[2].upper()}"
                 if route not in routes:
                     routes.append(route)
-
-    # 3) Резервный вариант для городов, которых ещё нет в словаре.
-    if not routes:
-        for m in re.finditer(
-            r'([А-ЯЁA-Z][А-Яа-яЁёA-Za-z. ]{1,35}?)\s*(?:→|->|=>|\s+-\s+)\s*'
-            r'([А-ЯЁA-Z][А-Яа-яЁёA-Za-z. ]{1,35})(?=[,.;\n]|$)',
-            t
-        ):
-            origin = normalize_city(m.group(1))
-            destination = normalize_city(m.group(2))
-            route = f"{origin.upper()} → {destination.upper()}"
-            if route not in routes:
-                routes.append(route)
 
     return routes[:4]
 
@@ -299,16 +332,11 @@ async def create(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Создать поездку в SNGAPP", url=SNGAPP_URL)]
     ])
-    await update.message.reply_text(
-        "🚗 Создайте поездку в SNGAPP.",
-        reply_markup=kb
-    )
+    await update.message.reply_text("🚗 Создайте поездку в SNGAPP.", reply_markup=kb)
 
 
 async def carriers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🚐 Здесь появится каталог регулярных перевозчиков."
-    )
+    await update.message.reply_text("🚐 Здесь появится каталог регулярных перевозчиков.")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -329,23 +357,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Создать поездку в SNGAPP", url=SNGAPP_URL)]
         ])
-        await q.message.reply_text(
-            "🚗 Создайте поездку в SNGAPP.",
-            reply_markup=kb
-        )
+        await q.message.reply_text("🚗 Создайте поездку в SNGAPP.", reply_markup=kb)
     elif q.data == "carriers":
-        await q.message.reply_text(
-            "🚐 Здесь появится каталог перевозчиков."
-        )
+        await q.message.reply_text("🚐 Здесь появится каталог перевозчиков.")
     else:
-        await q.message.reply_text(
-            "ℹ️ Просто перешлите объявление о поездке."
-        )
+        await q.message.reply_text("ℹ️ Просто перешлите объявление о поездке.")
 
 
 async def parse_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or update.message.caption or ""
-
     if not text:
         await update.message.reply_text("Не вижу текста объявления.")
         return
@@ -362,8 +382,7 @@ async def parse_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Места: {extract_seats(text)}\n"
         f"Цена: {extract_price(text)}\n"
         f"Телефон: {extract_phone(text)}\n\n"
-        "📄 Исходный текст:\n"
-        + text[:1800]
+        "📄 Исходный текст:\n" + text[:1800]
     )
 
     await update.message.reply_text(result)
