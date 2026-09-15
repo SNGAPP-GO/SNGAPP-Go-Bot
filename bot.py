@@ -109,51 +109,74 @@ def detect_type(text):
     return "❓ Не определено"
 
 
+def normalize_phone_key(raw):
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 11 and digits[0] in ("7", "8"):
+        return "7" + digits[1:]
+    return digits
+
+
 def extract_phone(text):
-    patterns = [
-        r'(?<!\d)(?:\+7|8)[\s\-\(\)]*\d{3}[\s\-\(\)]*\d{3}[\s\-]*\d{2}[\s\-]*\d{2}(?!\d)',
-        r'(?<!\d)8[\s\-]*\(?\d{4}\)?[\s\-]*\d{3}[\s\-]*\d{2}[\s\-]*\d{2}(?!\d)',
-    ]
+    # Поддерживает +7/8, скобки, пробелы, дефисы, 3- и 4-значные коды.
+    candidates = re.findall(
+        r'(?<!\d)(?:\+7|8)(?:[\s\-()]|\d){9,18}(?!\d)',
+        text
+    )
+
+    seen = set()
     result = []
-    for p in patterns:
-        for x in re.findall(p, text):
-            x = re.sub(r"\s+", " ", x).strip()
-            if x not in result:
-                result.append(x)
+
+    for raw in candidates:
+        key = normalize_phone_key(raw)
+        # Российский номер должен давать 11 цифр после нормализации.
+        if len(key) != 11 or not key.startswith("7"):
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(re.sub(r"\s+", " ", raw).strip())
+
     return ", ".join(result[:4]) if result else "—"
 
 
 def date_spans(text):
     spans = []
+
     for m in re.finditer(r'(?<!\d)(\d{1,2})\s*([./,])\s*(\d{1,2})\s*\2\s*(\d{2,4})(?!\d)', text):
         d, mo = int(m.group(1)), int(m.group(3))
         if 1 <= d <= 31 and 1 <= mo <= 12:
             spans.append((m.start(), m.end()))
+
     for m in re.finditer(r'(?<!\d)(\d{1,2})\s*([./])\s*(\d{1,2})(?![\d./])', text):
         d, mo = int(m.group(1)), int(m.group(3))
         if 1 <= d <= 31 and 1 <= mo <= 12:
             prefix = text[max(0, m.start()-8):m.start()].lower()
             if m.start() == 0 or text[m.start()-1] == "\n" or "дата" in prefix:
                 spans.append((m.start(), m.end()))
+
     return spans
 
 
 def extract_times(text):
     spans = date_spans(text)
     result = []
+
     for m in re.finditer(r'(?<!\d)(?:[01]?\d|2[0-3])[:.][0-5]\d(?!\d)', text):
         if any(m.start() < e and m.end() > s for s, e in spans):
             continue
+
         h, minute = re.split(r'[:.]', m.group(0))
         value = f"{int(h):02d}:{minute}"
         if value not in result:
             result.append(value)
+
     return result[:12]
 
 
 def extract_dates(text):
     result = []
     low = text.lower()
+
     for word in ("сегодня", "завтра", "послезавтра"):
         if re.search(rf'\b{word}\b', low):
             result.append(word)
@@ -169,6 +192,7 @@ def extract_dates(text):
         d, mo = int(m.group(1)), int(m.group(3))
         if not (1 <= d <= 31 and 1 <= mo <= 12):
             continue
+
         prefix = text[max(0, m.start()-8):m.start()].lower()
         if m.start() == 0 or text[m.start()-1] == "\n" or "дата" in prefix:
             val = f"{d:02d}.{mo:02d}"
@@ -184,6 +208,7 @@ def extract_seats(text):
         r'возьму\s*(\d+)(?:\s*-\s*(\d+))?\s*(?:попутчиков|пассажиров)?',
         r'до\s*(\d+)\s*(?:человек|пассажиров)',
     ]
+
     for p in patterns:
         m = re.search(p, text, flags=re.I)
         if m:
@@ -210,9 +235,11 @@ def extract_price(text):
 def find_known_cities(text):
     low = text.lower()
     matches = []
+
     for alias in sorted(CITY_ALIASES, key=len, reverse=True):
         for m in re.finditer(rf'(?<![а-яёa-z]){re.escape(alias)}(?![а-яёa-z])', low):
             matches.append((m.start(), m.end(), CITY_ALIASES[alias]))
+
     matches.sort(key=lambda x: (x[0], -(x[1]-x[0])))
 
     out, last_end = [], -1
@@ -220,6 +247,7 @@ def find_known_cities(text):
         if item[0] >= last_end:
             out.append(item)
             last_end = item[1]
+
     return out
 
 
@@ -250,8 +278,8 @@ def extract_routes(text):
 
 
 def extract_time_ranges(text):
-    """Все интервалы времени вида 05:00-05:45."""
     result = []
+
     for m in re.finditer(
         r'(?<!\d)((?:[01]?\d|2[0-3])[:.][0-5]\d)\s*-\s*((?:[01]?\d|2[0-3])[:.][0-5]\d)(?!\d)',
         text
@@ -263,16 +291,21 @@ def extract_time_ranges(text):
         value = f"{int(ah):02d}:{am}-{int(bh):02d}:{bm}"
         if value not in result:
             result.append(value)
+
     return result
 
 
 def extract_carrier_schedule(text):
     """
-    Разбирает большие регулярные объявления.
-    Возвращает короткий список маршрутов и расписаний.
+    Для регулярных перевозчиков:
+    - игнорирует рекламный список маршрутов без расписания;
+    - берет секции "Из X в Y", "Обратно из X в Y";
+    - берет маршруты вида "Ясный-Москва (пятница, суббота)";
+    - объединяет дубли и времена.
     """
     lines = [x.strip() for x in text.splitlines() if x.strip()]
     entries = []
+
     current_route = None
     current_days = None
     current_times = []
@@ -283,7 +316,7 @@ def extract_carrier_schedule(text):
             entries.append({
                 "route": current_route,
                 "days": current_days or "ежедневно",
-                "times": current_times[:10],
+                "times": list(dict.fromkeys(current_times)),
             })
         current_route = None
         current_days = None
@@ -293,7 +326,11 @@ def extract_carrier_schedule(text):
         clean = normalize_text(line)
 
         # "Из Орска в Ясный:"
-        m = re.search(r'\bиз\s+([А-ЯЁA-Z][А-Яа-яЁёA-Za-z\- ]+?)\s+в\s+([А-ЯЁA-Z][А-Яа-яЁёA-Za-z\- ]+?)\s*:?\s*$', clean, flags=re.I)
+        m = re.search(
+            r'^\s*из\s+([А-ЯЁA-Z][А-Яа-яЁёA-Za-z\- ]+?)\s+в\s+'
+            r'([А-ЯЁA-Z][А-Яа-яЁёA-Za-z\- ]+?)\s*:?\s*$',
+            clean, flags=re.I
+        )
         if m:
             flush()
             current_route = f"{normalize_city(m.group(1)).upper()} → {normalize_city(m.group(2)).upper()}"
@@ -301,7 +338,11 @@ def extract_carrier_schedule(text):
             continue
 
         # "Обратно из Ясного в Орск:"
-        m = re.search(r'\bобратно\s+из\s+([А-ЯЁA-Z][А-Яа-яЁёA-Za-z\- ]+?)\s+в\s+([А-ЯЁA-Z][А-Яа-яЁёA-Za-z\- ]+?)\s*:?\s*$', clean, flags=re.I)
+        m = re.search(
+            r'^\s*обратно\s+из\s+([А-ЯЁA-Z][А-Яа-яЁёA-Za-z\- ]+?)\s+в\s+'
+            r'([А-ЯЁA-Z][А-Яа-яЁёA-Za-z\- ]+?)\s*:?\s*$',
+            clean, flags=re.I
+        )
         if m:
             flush()
             current_route = f"{normalize_city(m.group(1)).upper()} → {normalize_city(m.group(2)).upper()}"
@@ -313,40 +354,64 @@ def extract_carrier_schedule(text):
         if len(cities) >= 2:
             a, b = cities[0], cities[1]
             between = clean[a[1]:b[0]]
-            if re.fullmatch(r'\s*(?:-|→|->|=>)\s*', between):
+
+            dm = re.search(r'\(([^)]+)\)', clean)
+            if re.fullmatch(r'\s*(?:-|→|->|=>)\s*', between) and dm:
                 flush()
                 current_route = f"{a[2].upper()} → {b[2].upper()}"
-                dm = re.search(r'\(([^)]+)\)', clean)
-                current_days = dm.group(1).strip() if dm else "ежедневно"
-
-                inline_ranges = extract_time_ranges(clean)
-                if inline_ranges:
-                    current_times.extend(inline_ranges)
+                current_days = dm.group(1).strip()
+                current_times.extend(extract_time_ranges(clean))
                 continue
 
+        # Времена относятся к текущей секции.
         if current_route:
-            current_times.extend(x for x in extract_time_ranges(clean) if x not in current_times)
+            for time_range in extract_time_ranges(clean):
+                if time_range not in current_times:
+                    current_times.append(time_range)
 
     flush()
-    return entries[:8]
+
+    # Объединяем дубли одного и того же маршрута + режима дней.
+    merged = {}
+    order = []
+
+    for entry in entries:
+        key = (entry["route"], entry["days"])
+        if key not in merged:
+            merged[key] = {
+                "route": entry["route"],
+                "days": entry["days"],
+                "times": [],
+            }
+            order.append(key)
+
+        for value in entry["times"]:
+            if value not in merged[key]["times"]:
+                merged[key]["times"].append(value)
+
+    return [merged[key] for key in order][:8]
 
 
 def format_carrier_schedule(entries):
     if not entries:
         return "—"
+
     blocks = []
     for e in entries:
         times = ", ".join(e["times"]) if e["times"] else "время не указано"
         blocks.append(f"{e['route']}\n{e['days']}: {times}")
+
     return "\n\n".join(blocks)
 
 
 def format_route_time_pairs(routes, times):
     if not routes:
         return "—"
+
     lines = []
     for i, route in enumerate(routes):
         lines.append(f"{route} — {times[i]}" if i < len(times) else route)
+
     return "\n".join(lines)
 
 
@@ -362,7 +427,9 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def create(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("➕ Создать поездку в SNGAPP", url=SNGAPP_URL)]])
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Создать поездку в SNGAPP", url=SNGAPP_URL)]
+    ])
     await update.message.reply_text("🚗 Создайте поездку в SNGAPP.", reply_markup=kb)
 
 
@@ -377,10 +444,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+
     if q.data == "search":
         await q.message.reply_text("🔎 Перешлите объявление из @ChedKazan или @blablacar_56.")
     elif q.data == "create":
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("➕ Создать поездку в SNGAPP", url=SNGAPP_URL)]])
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Создать поездку в SNGAPP", url=SNGAPP_URL)]
+        ])
         await q.message.reply_text("🚗 Создайте поездку в SNGAPP.", reply_markup=kb)
     elif q.data == "carriers":
         await q.message.reply_text("🚐 Здесь появится каталог перевозчиков.")
@@ -398,6 +468,7 @@ async def parse_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if kind == "🚐 Перевозчик":
         schedule = extract_carrier_schedule(text)
+
         result = (
             "🧪 Результат разбора\n\n"
             f"Тип: {kind}\n\n"
@@ -431,6 +502,7 @@ def main():
         raise RuntimeError("Переменная BOT_TOKEN не задана")
 
     app = Application.builder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("search", search))
     app.add_handler(CommandHandler("create", create))
