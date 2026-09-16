@@ -735,17 +735,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
 
     if q.data == "search":
-        rows = latest_rides(10)
-
-        if not rows:
-            await q.message.reply_text("🔎 Каталог пока пуст.")
-        else:
-            text = (
-                "🔎 Последние поездки в каталоге\n\n"
-                + "\n\n".join(format_search_row(r) for r in rows)
-                + "\n\nДля поиска маршрута напишите, например:\n/search Казань Оренбург"
-            )
-            await q.message.reply_text(text[:3900])
+        context.user_data["awaiting_search"] = True
+        await q.message.reply_text(
+            "🔎 Напишите маршрут обычным сообщением, например:\n"
+            "Ясный Орск\n\n"
+            "Или командой:\n/search Ясный Орск"
+        )
 
     elif q.data == "create":
         kb = InlineKeyboardMarkup([
@@ -772,10 +767,60 @@ async def parse_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or update.message.caption or ""
 
     if not text:
-        await update.message.reply_text("Не вижу текста объявления.")
+        await update.message.reply_text("Не вижу текста.")
+        return
+
+    # Если пользователь нажал "Найти поездку", следующее обычное сообщение — поисковый запрос.
+    if context.user_data.pop("awaiting_search", False):
+        rows, terms = search_rides(text, 10)
+
+        if not rows:
+            await update.message.reply_text(
+                "🔎 По этому маршруту пока ничего не найдено.\n\n"
+                "Попробуйте другой маршрут."
+            )
+            return
+
+        label = " → ".join(terms) if terms else text
+        result = (
+            f"🔎 Найдено по запросу: {label}\n\n"
+            + "\n\n".join(format_search_row(r) for r in rows)
+        )
+        await update.message.reply_text(result[:3900])
         return
 
     parsed = parse_payload(text)
+
+    # Сообщение, состоящее просто из двух известных городов, считаем поиском,
+    # а не объявлением. Это защищает каталог от записей вроде "Ясный Орск".
+    known = find_known_cities(text)
+    words_only = re.sub(r"[^А-Яа-яЁёA-Za-z\- ]+", " ", text)
+    words_only = re.sub(r"\s+", " ", words_only).strip()
+
+    if parsed["kind"] == "❓ Не определено" and len(known) >= 2 and len(words_only.split()) <= 5:
+        rows, terms = search_rides(text, 10)
+
+        if not rows:
+            await update.message.reply_text(
+                "🔎 По этому маршруту пока ничего не найдено."
+            )
+            return
+
+        label = " → ".join(terms) if terms else text
+        result = (
+            f"🔎 Найдено по запросу: {label}\n\n"
+            + "\n\n".join(format_search_row(r) for r in rows)
+        )
+        await update.message.reply_text(result[:3900])
+        return
+
+    # Не сохраняем случайный текст, который не похож ни на поездку, ни на пассажирский запрос.
+    if parsed["kind"] == "❓ Не определено":
+        await update.message.reply_text(
+            "Не понял, это объявление или поиск.\n\n"
+            "Для поиска напишите два города, например: Ясный Орск."
+        )
+        return
 
     try:
         ride_id, inserted = save_ride(update.message, parsed)
