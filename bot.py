@@ -188,6 +188,56 @@ def latest_rides(limit=10):
             return cur.fetchall()
 
 
+def normalize_search_term(value):
+    value = re.sub(r"\\s+", " ", value.strip(" ,.;:-→"))
+    if not value:
+        return ""
+    return CITY_ALIASES.get(value.lower(), value).upper()
+
+
+def search_rides(query_text, limit=10):
+    raw = re.sub(r"[→,;]+", " ", query_text)
+    raw = re.sub(r"\\s+", " ", raw).strip()
+
+    if not raw:
+        return latest_rides(limit), []
+
+    words = raw.split()
+    terms = []
+
+    # Сначала пытаемся распознать известные города, включая составные названия.
+    known = find_known_cities(raw)
+    for item in known:
+        city = item[2].upper()
+        if city not in terms:
+            terms.append(city)
+
+    # Если словарь не нашёл города, используем введённые слова как поисковые термины.
+    if not terms:
+        terms = [normalize_search_term(w) for w in words if normalize_search_term(w)]
+
+    terms = terms[:2]
+
+    sql = """
+        SELECT id, ride_type, routes, dates, times, seats, price
+        FROM rides
+        WHERE ride_type IN ('🚗 Водитель', '🚐 Перевозчик')
+    """
+    params = []
+
+    for term in terms:
+        sql += " AND UPPER(routes::text) LIKE %s"
+        params.append(f"%{term}%")
+
+    sql += " ORDER BY created_at DESC LIMIT %s"
+    params.append(limit)
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, tuple(params))
+            return cur.fetchall(), terms
+
+
 def normalize_text(text):
     return re.sub(r"[ \t]+", " ", text.replace("—", "-").replace("–", "-")).strip()
 
@@ -622,16 +672,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = latest_rides(10)
+    query_text = " ".join(context.args).strip()
 
-    if not rows:
-        await update.message.reply_text("🔎 Каталог пока пуст.")
-        return
+    if query_text:
+        rows, terms = search_rides(query_text, 10)
 
-    text = (
-        "🔎 Последние поездки в каталоге\n\n"
-        + "\n\n".join(format_search_row(r) for r in rows)
-    )
+        if not rows:
+            await update.message.reply_text(
+                "🔎 По этому маршруту пока ничего не найдено.\n\n"
+                "Пример поиска: /search Казань Оренбург"
+            )
+            return
+
+        label = " → ".join(terms) if terms else query_text
+        text = (
+            f"🔎 Найдено по запросу: {label}\n\n"
+            + "\n\n".join(format_search_row(r) for r in rows)
+        )
+    else:
+        rows = latest_rides(10)
+
+        if not rows:
+            await update.message.reply_text("🔎 Каталог пока пуст.")
+            return
+
+        text = (
+            "🔎 Последние поездки в каталоге\n\n"
+            + "\n\n".join(format_search_row(r) for r in rows)
+            + "\n\nДля поиска маршрута: /search Казань Оренбург"
+        )
 
     await update.message.reply_text(text[:3900])
 
@@ -656,7 +725,8 @@ async def carriers(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "ℹ️ Перешлите или вставьте объявление — бот сохранит его в каталог.\n"
-        "/search — показать последние поездки."
+        "/search — последние поездки\n"
+        "/search Казань Оренбург — поиск по маршруту"
     )
 
 
@@ -673,6 +743,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = (
                 "🔎 Последние поездки в каталоге\n\n"
                 + "\n\n".join(format_search_row(r) for r in rows)
+                + "\n\nДля поиска маршрута напишите, например:\n/search Казань Оренбург"
             )
             await q.message.reply_text(text[:3900])
 
