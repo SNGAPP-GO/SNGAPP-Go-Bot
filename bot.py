@@ -2,6 +2,7 @@ import os
 import re
 import json
 import hashlib
+from datetime import datetime, date, timedelta
 import psycopg
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -175,21 +176,100 @@ def save_ride(message, parsed):
     return ride_id, inserted
 
 
+def parse_catalog_date(value, today=None):
+    """
+    Преобразует даты каталога в date.
+    Поддержка: 17.09, 17.09.2026, 17.09.26.
+    Для даты без года используем ближайший логичный год около текущей даты.
+    """
+    if today is None:
+        today = date.today()
+
+    value = str(value).strip().lower()
+
+    # Относительные даты считаем актуальными.
+    if value in ("сегодня", "завтра", "послезавтра"):
+        delta = {"сегодня": 0, "завтра": 1, "послезавтра": 2}[value]
+        return today + timedelta(days=delta)
+
+    m = re.fullmatch(r"(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?", value)
+    if not m:
+        return None
+
+    day_num = int(m.group(1))
+    month_num = int(m.group(2))
+    year_text = m.group(3)
+
+    try:
+        if year_text:
+            year_num = int(year_text)
+            if year_num < 100:
+                year_num += 2000
+            return date(year_num, month_num, day_num)
+
+        candidate = date(today.year, month_num, day_num)
+
+        # Переход через Новый год:
+        # 02.01 в конце декабря считаем следующим годом,
+        # 31.12 в начале января — прошлым.
+        if candidate < today - timedelta(days=180):
+            candidate = date(today.year + 1, month_num, day_num)
+        elif candidate > today + timedelta(days=180):
+            candidate = date(today.year - 1, month_num, day_num)
+
+        return candidate
+    except ValueError:
+        return None
+
+
+def ride_is_active(row, today=None):
+    if today is None:
+        today = date.today()
+
+    ride_id, ride_type, routes, dates, times, seats, price = row
+
+    # Регулярные перевозчики не истекают по одной дате.
+    if ride_type == "🚐 Перевозчик":
+        return True
+
+    # Если дата не указана, пока оставляем запись в каталоге.
+    if not dates:
+        return True
+
+    parsed_dates = [parse_catalog_date(x, today) for x in dates]
+    parsed_dates = [x for x in parsed_dates if x is not None]
+
+    # Если формат даты непонятен, не удаляем запись автоматически.
+    if not parsed_dates:
+        return True
+
+    return max(parsed_dates) >= today
+
+
+def filter_active_rides(rows, limit=10):
+    today = date.today()
+    active = [row for row in rows if ride_is_active(row, today)]
+    return active[:limit]
+
+
 def latest_rides(limit=10):
     with db_connect() as conn:
         with conn.cursor() as cur:
+            # Берём запас, потому что часть записей может оказаться просроченной.
             cur.execute("""
                 SELECT id, ride_type, routes, dates, times, seats, price
                 FROM rides
                 WHERE ride_type IN ('🚗 Водитель', '🚐 Перевозчик')
                 ORDER BY created_at DESC
-                LIMIT %s;
-            """, (limit,))
-            return cur.fetchall()
+                LIMIT 200;
+            """)
+            rows = cur.fetchall()
+
+    return filter_active_rides(rows, limit)
 
 
 def normalize_search_term(value):
-    value = re.sub(r"\\s+", " ", value.strip(" ,.;:-→"))
+    value = re.sub(r"\s+", " ", value.strip(" ,.;:-→"))
     if not value:
         return ""
     return CITY_ALIASES.get(value.lower(), value).upper()
@@ -197,7 +277,7 @@ def normalize_search_term(value):
 
 def search_rides(query_text, limit=10):
     raw = re.sub(r"[→,;]+", " ", query_text)
-    raw = re.sub(r"\\s+", " ", raw).strip()
+    raw = re.sub(r"\s+", " ", raw).strip()
 
     if not raw:
         return latest_rides(limit), []
@@ -229,13 +309,15 @@ def search_rides(query_text, limit=10):
         sql += " AND UPPER(routes::text) LIKE %s"
         params.append(f"%{term}%")
 
-    sql += " ORDER BY created_at DESC LIMIT %s"
-    params.append(limit)
+    # Берём запас, затем отбрасываем просроченные поездки в Python.
+    sql += " ORDER BY created_at DESC LIMIT 200"
 
     with db_connect() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, tuple(params))
-            return cur.fetchall(), terms
+            rows = cur.fetchall()
+
+    return filter_active_rides(rows, limit), terms
 
 
 def normalize_text(text):
@@ -726,7 +808,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "ℹ️ Перешлите или вставьте объявление — бот сохранит его в каталог.\n"
         "/search — последние поездки\n"
-        "/search Казань Оренбург — поиск по маршруту"
+        "/search Казань Оренбург — поиск по маршруту\n"
+        "Просроченные поездки автоматически скрываются из поиска."
     )
 
 
