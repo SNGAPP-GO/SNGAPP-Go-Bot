@@ -853,8 +853,19 @@ async def parse_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не вижу текста.")
         return
 
-    # Если пользователь нажал "Найти поездку", следующее обычное сообщение — поисковый запрос.
-    if context.user_data.pop("awaiting_search", False):
+    # Пересланное сообщение всегда считаем объявлением, а не поисковым запросом.
+    is_forwarded = bool(
+        getattr(update.message, "forward_origin", None)
+        or getattr(update.message, "forward_date", None)
+        or getattr(update.message, "forward_from", None)
+        or getattr(update.message, "forward_from_chat", None)
+    )
+
+    awaiting_search = context.user_data.pop("awaiting_search", False)
+
+    # Только обычное (не пересланное) сообщение после кнопки "Найти поездку"
+    # считаем поисковым запросом.
+    if awaiting_search and not is_forwarded:
         rows, terms = search_rides(text, 10)
 
         if not rows:
@@ -880,7 +891,12 @@ async def parse_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     words_only = re.sub(r"[^А-Яа-яЁёA-Za-z\- ]+", " ", text)
     words_only = re.sub(r"\s+", " ", words_only).strip()
 
-    if parsed["kind"] == "❓ Не определено" and len(known) >= 2 and len(words_only.split()) <= 5:
+    if (
+        not is_forwarded
+        and parsed["kind"] == "❓ Не определено"
+        and len(known) >= 2
+        and len(words_only.split()) <= 5
+    ):
         rows, terms = search_rides(text, 10)
 
         if not rows:
