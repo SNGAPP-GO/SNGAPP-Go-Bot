@@ -142,7 +142,18 @@ def save_ride(message, parsed):
                     %s, %s, %s, %s
                 )
                 ON CONFLICT (content_hash)
-                DO UPDATE SET created_at = rides.created_at
+                DO UPDATE SET
+                    telegram_message_id = EXCLUDED.telegram_message_id,
+                    telegram_chat_id = EXCLUDED.telegram_chat_id,
+                    ride_type = EXCLUDED.ride_type,
+                    routes = EXCLUDED.routes,
+                    dates = EXCLUDED.dates,
+                    times = EXCLUDED.times,
+                    schedule = EXCLUDED.schedule,
+                    seats = EXCLUDED.seats,
+                    price = EXCLUDED.price,
+                    phone = EXCLUDED.phone,
+                    raw_text = EXCLUDED.raw_text
                 RETURNING id, (xmax = 0) AS inserted;
             """, (
                 fingerprint,
@@ -262,7 +273,7 @@ def date_spans(text):
             spans.append((m.start(), m.end()))
 
     for m in re.finditer(
-        r'(?<!\d)(\d{1,2})\s*([./])\s*(\d{1,2})(?![\d./])',
+        r'(?<!\d)(\d{1,2})\s*([./])\s*(\d{1,2})(?:\s*\.)?(?!\d)',
         text
     ):
         d, mo = int(m.group(1)), int(m.group(3))
@@ -310,7 +321,7 @@ def extract_dates(text):
                 result.append(value)
 
     for m in re.finditer(
-        r'(?<!\d)(\d{1,2})\s*([./])\s*(\d{1,2})(?![\d./])',
+        r'(?<!\d)(\d{1,2})\s*([./])\s*(\d{1,2})(?:\s*\.)?(?!\d)',
         text
     ):
         d, mo = int(m.group(1)), int(m.group(3))
@@ -722,7 +733,11 @@ async def parse_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Телефон: {parsed['phone']}"
         )
 
-    status = "✅ Сохранено в каталог" if inserted else "♻️ Такое объявление уже есть в каталоге"
+    status = (
+        "✅ Сохранено в каталог"
+        if inserted
+        else "♻️ Объявление уже было в каталоге — данные обновлены"
+    )
 
     await update.message.reply_text(
         f"{status}\n\n"
