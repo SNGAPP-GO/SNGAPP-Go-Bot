@@ -1,8 +1,20 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
-from config import BOT_TOKEN
+import os
 import re
+import json
+import hashlib
+import psycopg
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+from config import BOT_TOKEN
 
+DATABASE_URL = os.getenv("DATABASE_URL")
 SNGAPP_URL = "https://t.me/sngapp_bot/app"
 
 CITY_ALIASES = {
@@ -64,6 +76,107 @@ def main_menu():
     ])
 
 
+def db_connect():
+    if not DATABASE_URL:
+        raise RuntimeError("Переменная DATABASE_URL не задана")
+    return psycopg.connect(DATABASE_URL)
+
+
+def init_db():
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS rides (
+                    id BIGSERIAL PRIMARY KEY,
+                    content_hash TEXT UNIQUE NOT NULL,
+                    telegram_message_id BIGINT,
+                    telegram_chat_id BIGINT,
+                    ride_type TEXT NOT NULL,
+                    routes JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    dates JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    times JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    schedule JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    seats TEXT,
+                    price TEXT,
+                    phone TEXT,
+                    raw_text TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS rides_created_at_idx
+                ON rides(created_at DESC);
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS rides_ride_type_idx
+                ON rides(ride_type);
+            """)
+        conn.commit()
+
+
+def save_ride(message, parsed):
+    fingerprint = hashlib.sha256(
+        re.sub(r"\s+", " ", parsed["raw_text"].strip().lower()).encode("utf-8")
+    ).hexdigest()
+
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO rides (
+                    content_hash,
+                    telegram_message_id,
+                    telegram_chat_id,
+                    ride_type,
+                    routes,
+                    dates,
+                    times,
+                    schedule,
+                    seats,
+                    price,
+                    phone,
+                    raw_text
+                )
+                VALUES (
+                    %s, %s, %s, %s,
+                    %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb,
+                    %s, %s, %s, %s
+                )
+                ON CONFLICT (content_hash)
+                DO UPDATE SET created_at = rides.created_at
+                RETURNING id, (xmax = 0) AS inserted;
+            """, (
+                fingerprint,
+                message.message_id,
+                message.chat_id,
+                parsed["kind"],
+                json.dumps(parsed["routes"], ensure_ascii=False),
+                json.dumps(parsed["dates"], ensure_ascii=False),
+                json.dumps(parsed["times"], ensure_ascii=False),
+                json.dumps(parsed["schedule"], ensure_ascii=False),
+                parsed["seats"],
+                parsed["price"],
+                parsed["phone"],
+                parsed["raw_text"],
+            ))
+            ride_id, inserted = cur.fetchone()
+        conn.commit()
+
+    return ride_id, inserted
+
+
+def latest_rides(limit=10):
+    with db_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, ride_type, routes, dates, times, seats, price
+                FROM rides
+                WHERE ride_type IN ('🚗 Водитель', '🚐 Перевозчик')
+                ORDER BY created_at DESC
+                LIMIT %s;
+            """, (limit,))
+            return cur.fetchall()
+
+
 def normalize_text(text):
     return re.sub(r"[ \t]+", " ", text.replace("—", "-").replace("–", "-")).strip()
 
@@ -117,7 +230,6 @@ def normalize_phone_key(raw):
 
 
 def extract_phone(text):
-    # Поддерживает +7/8, скобки, пробелы, дефисы, 3- и 4-значные коды.
     candidates = re.findall(
         r'(?<!\d)(?:\+7|8)(?:[\s\-()]|\d){9,18}(?!\d)',
         text
@@ -128,7 +240,6 @@ def extract_phone(text):
 
     for raw in candidates:
         key = normalize_phone_key(raw)
-        # Российский номер должен давать 11 цифр после нормализации.
         if len(key) != 11 or not key.startswith("7"):
             continue
         if key in seen:
@@ -142,16 +253,23 @@ def extract_phone(text):
 def date_spans(text):
     spans = []
 
-    for m in re.finditer(r'(?<!\d)(\d{1,2})\s*([./,])\s*(\d{1,2})\s*\2\s*(\d{2,4})(?!\d)', text):
+    for m in re.finditer(
+        r'(?<!\d)(\d{1,2})\s*([./,])\s*(\d{1,2})\s*\2\s*(\d{2,4})(?!\d)',
+        text
+    ):
         d, mo = int(m.group(1)), int(m.group(3))
         if 1 <= d <= 31 and 1 <= mo <= 12:
             spans.append((m.start(), m.end()))
 
-    for m in re.finditer(r'(?<!\d)(\d{1,2})\s*([./])\s*(\d{1,2})(?![\d./])', text):
+    for m in re.finditer(
+        r'(?<!\d)(\d{1,2})\s*([./])\s*(\d{1,2})(?![\d./])',
+        text
+    ):
         d, mo = int(m.group(1)), int(m.group(3))
         if 1 <= d <= 31 and 1 <= mo <= 12:
             prefix = text[max(0, m.start()-8):m.start()].lower()
-            if m.start() == 0 or text[m.start()-1] == "\n" or "дата" in prefix:
+            at_line_start = m.start() == 0 or text[m.start()-1] == "\n"
+            if at_line_start or "дата" in prefix:
                 spans.append((m.start(), m.end()))
 
     return spans
@@ -162,11 +280,11 @@ def extract_times(text):
     result = []
 
     for m in re.finditer(r'(?<!\d)(?:[01]?\d|2[0-3])[:.][0-5]\d(?!\d)', text):
-        if any(m.start() < e and m.end() > s for s, e in spans):
+        if any(m.start() < end and m.end() > start for start, end in spans):
             continue
 
-        h, minute = re.split(r'[:.]', m.group(0))
-        value = f"{int(h):02d}:{minute}"
+        hour, minute = re.split(r'[:.]', m.group(0))
+        value = f"{int(hour):02d}:{minute}"
         if value not in result:
             result.append(value)
 
@@ -175,29 +293,37 @@ def extract_times(text):
 
 def extract_dates(text):
     result = []
-    low = text.lower()
+    t = text.lower()
 
     for word in ("сегодня", "завтра", "послезавтра"):
-        if re.search(rf'\b{word}\b', low):
+        if re.search(rf'\b{word}\b', t):
             result.append(word)
 
-    for m in re.finditer(r'(?<!\d)(\d{1,2})\s*([./,])\s*(\d{1,2})\s*\2\s*(\d{2,4})(?!\d)', text):
-        d, mo, y = int(m.group(1)), int(m.group(3)), m.group(4)
+    for m in re.finditer(
+        r'(?<!\d)(\d{1,2})\s*([./,])\s*(\d{1,2})\s*\2\s*(\d{2,4})(?!\d)',
+        text
+    ):
+        d, mo, year = int(m.group(1)), int(m.group(3)), m.group(4)
         if 1 <= d <= 31 and 1 <= mo <= 12:
-            val = f"{d:02d}.{mo:02d}.{y}"
-            if val not in result:
-                result.append(val)
+            value = f"{d:02d}.{mo:02d}.{year}"
+            if value not in result:
+                result.append(value)
 
-    for m in re.finditer(r'(?<!\d)(\d{1,2})\s*([./])\s*(\d{1,2})(?![\d./])', text):
+    for m in re.finditer(
+        r'(?<!\d)(\d{1,2})\s*([./])\s*(\d{1,2})(?![\d./])',
+        text
+    ):
         d, mo = int(m.group(1)), int(m.group(3))
         if not (1 <= d <= 31 and 1 <= mo <= 12):
             continue
 
         prefix = text[max(0, m.start()-8):m.start()].lower()
-        if m.start() == 0 or text[m.start()-1] == "\n" or "дата" in prefix:
-            val = f"{d:02d}.{mo:02d}"
-            if val not in result:
-                result.append(val)
+        at_line_start = m.start() == 0 or text[m.start()-1] == "\n"
+
+        if at_line_start or "дата" in prefix:
+            value = f"{d:02d}.{mo:02d}"
+            if value not in result:
+                result.append(value)
 
     return result
 
@@ -217,7 +343,11 @@ def extract_seats(text):
             return m.group(1)
 
     words = "|".join(NUMBER_WORDS.keys())
-    m = re.search(rf'\b(?:есть\s+)?({words})\s+(?:места|мест|место)\b', text, flags=re.I)
+    m = re.search(
+        rf'\b(?:есть\s+)?({words})\s+(?:места|мест|место)\b',
+        text,
+        flags=re.I
+    )
     return NUMBER_WORDS[m.group(1).lower()] if m else "—"
 
 
@@ -237,7 +367,10 @@ def find_known_cities(text):
     matches = []
 
     for alias in sorted(CITY_ALIASES, key=len, reverse=True):
-        for m in re.finditer(rf'(?<![а-яёa-z]){re.escape(alias)}(?![а-яёa-z])', low):
+        for m in re.finditer(
+            rf'(?<![а-яёa-z]){re.escape(alias)}(?![а-яёa-z])',
+            low
+        ):
             matches.append((m.start(), m.end(), CITY_ALIASES[alias]))
 
     matches.sort(key=lambda x: (x[0], -(x[1]-x[0])))
@@ -258,7 +391,8 @@ def extract_routes(text):
     for m in re.finditer(
         r'\b(?:с|из)\s+([А-ЯЁA-Z][А-Яа-яЁёA-Za-z.\- ]{1,35}?)\s+в\s+'
         r'([А-ЯЁA-Z][А-Яа-яЁёA-Za-z.\- ]{1,35}?)(?=\s+в\s+\d{1,2}[.:]\d{2}|[,.;:\n]|$)',
-        t, flags=re.I
+        t,
+        flags=re.I
     ):
         a, b = normalize_city(m.group(1)), normalize_city(m.group(2))
         route = f"{a.upper()} → {b.upper()}"
@@ -269,6 +403,7 @@ def extract_routes(text):
     for i in range(len(cities)-1):
         a, b = cities[i], cities[i+1]
         between = t[a[1]:b[0]]
+
         if re.fullmatch(r'\s*(?:-|→|->|=>)\s*', between):
             route = f"{a[2].upper()} → {b[2].upper()}"
             if route not in routes:
@@ -281,7 +416,8 @@ def extract_time_ranges(text):
     result = []
 
     for m in re.finditer(
-        r'(?<!\d)((?:[01]?\d|2[0-3])[:.][0-5]\d)\s*-\s*((?:[01]?\d|2[0-3])[:.][0-5]\d)(?!\d)',
+        r'(?<!\d)((?:[01]?\d|2[0-3])[:.][0-5]\d)\s*-\s*'
+        r'((?:[01]?\d|2[0-3])[:.][0-5]\d)(?!\d)',
         text
     ):
         a = m.group(1).replace(".", ":")
@@ -289,6 +425,7 @@ def extract_time_ranges(text):
         ah, am = a.split(":")
         bh, bm = b.split(":")
         value = f"{int(ah):02d}:{am}-{int(bh):02d}:{bm}"
+
         if value not in result:
             result.append(value)
 
@@ -296,13 +433,6 @@ def extract_time_ranges(text):
 
 
 def extract_carrier_schedule(text):
-    """
-    Для регулярных перевозчиков:
-    - игнорирует рекламный список маршрутов без расписания;
-    - берет секции "Из X в Y", "Обратно из X в Y";
-    - берет маршруты вида "Ясный-Москва (пятница, суббота)";
-    - объединяет дубли и времена.
-    """
     lines = [x.strip() for x in text.splitlines() if x.strip()]
     entries = []
 
@@ -312,12 +442,14 @@ def extract_carrier_schedule(text):
 
     def flush():
         nonlocal current_route, current_days, current_times
+
         if current_route:
             entries.append({
                 "route": current_route,
                 "days": current_days or "ежедневно",
                 "times": list(dict.fromkeys(current_times)),
             })
+
         current_route = None
         current_days = None
         current_times = []
@@ -325,37 +457,43 @@ def extract_carrier_schedule(text):
     for line in lines:
         clean = normalize_text(line)
 
-        # "Из Орска в Ясный:"
         m = re.search(
             r'^\s*из\s+([А-ЯЁA-Z][А-Яа-яЁёA-Za-z\- ]+?)\s+в\s+'
             r'([А-ЯЁA-Z][А-Яа-яЁёA-Za-z\- ]+?)\s*:?\s*$',
-            clean, flags=re.I
+            clean,
+            flags=re.I
         )
         if m:
             flush()
-            current_route = f"{normalize_city(m.group(1)).upper()} → {normalize_city(m.group(2)).upper()}"
+            current_route = (
+                f"{normalize_city(m.group(1)).upper()} → "
+                f"{normalize_city(m.group(2)).upper()}"
+            )
             current_days = "ежедневно"
             continue
 
-        # "Обратно из Ясного в Орск:"
         m = re.search(
             r'^\s*обратно\s+из\s+([А-ЯЁA-Z][А-Яа-яЁёA-Za-z\- ]+?)\s+в\s+'
             r'([А-ЯЁA-Z][А-Яа-яЁёA-Za-z\- ]+?)\s*:?\s*$',
-            clean, flags=re.I
+            clean,
+            flags=re.I
         )
         if m:
             flush()
-            current_route = f"{normalize_city(m.group(1)).upper()} → {normalize_city(m.group(2)).upper()}"
+            current_route = (
+                f"{normalize_city(m.group(1)).upper()} → "
+                f"{normalize_city(m.group(2)).upper()}"
+            )
             current_days = "ежедневно"
             continue
 
-        # "Ясный-Москва (пятница,суббота)"
         cities = find_known_cities(clean)
+
         if len(cities) >= 2:
             a, b = cities[0], cities[1]
             between = clean[a[1]:b[0]]
-
             dm = re.search(r'\(([^)]+)\)', clean)
+
             if re.fullmatch(r'\s*(?:-|→|->|=>)\s*', between) and dm:
                 flush()
                 current_route = f"{a[2].upper()} → {b[2].upper()}"
@@ -363,7 +501,6 @@ def extract_carrier_schedule(text):
                 current_times.extend(extract_time_ranges(clean))
                 continue
 
-        # Времена относятся к текущей секции.
         if current_route:
             for time_range in extract_time_ranges(clean):
                 if time_range not in current_times:
@@ -371,12 +508,12 @@ def extract_carrier_schedule(text):
 
     flush()
 
-    # Объединяем дубли одного и того же маршрута + режима дней.
     merged = {}
     order = []
 
     for entry in entries:
         key = (entry["route"], entry["days"])
+
         if key not in merged:
             merged[key] = {
                 "route": entry["route"],
@@ -392,16 +529,31 @@ def extract_carrier_schedule(text):
     return [merged[key] for key in order][:8]
 
 
-def format_carrier_schedule(entries):
-    if not entries:
-        return "—"
+def parse_payload(text):
+    kind = detect_type(text)
 
-    blocks = []
-    for e in entries:
-        times = ", ".join(e["times"]) if e["times"] else "время не указано"
-        blocks.append(f"{e['route']}\n{e['days']}: {times}")
+    if kind == "🚐 Перевозчик":
+        schedule = extract_carrier_schedule(text)
+        routes = [x["route"] for x in schedule]
+        dates = []
+        times = []
+    else:
+        schedule = []
+        routes = extract_routes(text)
+        dates = extract_dates(text)
+        times = extract_times(text)
 
-    return "\n\n".join(blocks)
+    return {
+        "kind": kind,
+        "routes": routes,
+        "dates": dates,
+        "times": times,
+        "schedule": schedule,
+        "seats": extract_seats(text),
+        "price": extract_price(text),
+        "phone": extract_phone(text),
+        "raw_text": text,
+    }
 
 
 def format_route_time_pairs(routes, times):
@@ -415,30 +567,86 @@ def format_route_time_pairs(routes, times):
     return "\n".join(lines)
 
 
+def format_carrier_schedule(entries):
+    if not entries:
+        return "—"
+
+    blocks = []
+
+    for e in entries:
+        times = ", ".join(e["times"]) if e["times"] else "время не указано"
+        blocks.append(f"{e['route']}\n{e['days']}: {times}")
+
+    return "\n\n".join(blocks)
+
+
+def format_search_row(row):
+    ride_id, ride_type, routes, dates, times, seats, price = row
+
+    route_text = " / ".join(routes) if routes else "Маршрут не распознан"
+    date_text = ", ".join(dates) if dates else "дата не указана"
+    time_text = ", ".join(times) if times else ""
+
+    line = f"#{ride_id} {ride_type}\n{route_text}\n{date_text}"
+
+    if time_text:
+        line += f" · {time_text}"
+
+    if seats and seats != "—":
+        line += f"\nМеста: {seats}"
+
+    if price and price != "—":
+        line += f" · Цена: {price}"
+
+    return line
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🚘 SNGAPP Go\n\nДля теста просто перешлите мне объявление о поездке из Telegram-группы.",
+        "🚘 SNGAPP Go\n\n"
+        "Перешлите объявление — я разберу его и сохраню в каталог.\n"
+        "Команда /search покажет последние поездки.",
         reply_markup=main_menu()
     )
 
 
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔎 Перешлите реальный пост из @ChedKazan или @blablacar_56.")
+    rows = latest_rides(10)
+
+    if not rows:
+        await update.message.reply_text("🔎 Каталог пока пуст.")
+        return
+
+    text = (
+        "🔎 Последние поездки в каталоге\n\n"
+        + "\n\n".join(format_search_row(r) for r in rows)
+    )
+
+    await update.message.reply_text(text[:3900])
 
 
 async def create(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Создать поездку в SNGAPP", url=SNGAPP_URL)]
     ])
-    await update.message.reply_text("🚗 Создайте поездку в SNGAPP.", reply_markup=kb)
+
+    await update.message.reply_text(
+        "🚗 Создайте поездку в SNGAPP.",
+        reply_markup=kb
+    )
 
 
 async def carriers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚐 Здесь появится каталог регулярных перевозчиков.")
+    await update.message.reply_text(
+        "🚐 Перевозчики сохраняются в общий каталог. Используйте /search."
+    )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("ℹ️ Для теста можно просто переслать или вставить текст объявления.")
+    await update.message.reply_text(
+        "ℹ️ Перешлите или вставьте объявление — бот сохранит его в каталог.\n"
+        "/search — показать последние поездки."
+    )
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -446,60 +654,93 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
 
     if q.data == "search":
-        await q.message.reply_text("🔎 Перешлите объявление из @ChedKazan или @blablacar_56.")
+        rows = latest_rides(10)
+
+        if not rows:
+            await q.message.reply_text("🔎 Каталог пока пуст.")
+        else:
+            text = (
+                "🔎 Последние поездки в каталоге\n\n"
+                + "\n\n".join(format_search_row(r) for r in rows)
+            )
+            await q.message.reply_text(text[:3900])
+
     elif q.data == "create":
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Создать поездку в SNGAPP", url=SNGAPP_URL)]
         ])
-        await q.message.reply_text("🚗 Создайте поездку в SNGAPP.", reply_markup=kb)
+
+        await q.message.reply_text(
+            "🚗 Создайте поездку в SNGAPP.",
+            reply_markup=kb
+        )
+
     elif q.data == "carriers":
-        await q.message.reply_text("🚐 Здесь появится каталог перевозчиков.")
+        await q.message.reply_text(
+            "🚐 Перевозчики сохраняются в общий каталог. Используйте /search."
+        )
+
     else:
-        await q.message.reply_text("ℹ️ Просто перешлите объявление о поездке.")
+        await q.message.reply_text(
+            "ℹ️ Перешлите объявление — я сохраню его в каталог."
+        )
 
 
 async def parse_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or update.message.caption or ""
+
     if not text:
         await update.message.reply_text("Не вижу текста объявления.")
         return
 
-    kind = detect_type(text)
+    parsed = parse_payload(text)
 
-    if kind == "🚐 Перевозчик":
-        schedule = extract_carrier_schedule(text)
+    try:
+        ride_id, inserted = save_ride(update.message, parsed)
+    except Exception as e:
+        await update.message.reply_text(
+            "⚠️ Текст разобран, но сохранить его в базу не удалось.\n"
+            f"Ошибка: {e}"
+        )
+        return
 
-        result = (
-            "🧪 Результат разбора\n\n"
-            f"Тип: {kind}\n\n"
-            f"Маршруты и расписание:\n{format_carrier_schedule(schedule)}\n\n"
-            f"Телефон: {extract_phone(text)}\n"
-            f"Цена: {extract_price(text)}\n"
-            f"Места: {extract_seats(text)}\n\n"
-            "📄 Исходный текст: большой рекламный пост, сохранён для дальнейшей обработки."
+    if parsed["kind"] == "🚐 Перевозчик":
+        details = (
+            f"Маршруты и расписание:\n"
+            f"{format_carrier_schedule(parsed['schedule'])}\n\n"
+            f"Телефон: {parsed['phone']}\n"
+            f"Цена: {parsed['price']}\n"
+            f"Места: {parsed['seats']}"
         )
     else:
-        routes = extract_routes(text)
-        times = extract_times(text)
-        dates = extract_dates(text)
-
-        result = (
-            "🧪 Результат разбора\n\n"
-            f"Тип: {kind}\n"
-            f"Маршруты:\n{format_route_time_pairs(routes, times)}\n"
-            f"Дата: {', '.join(dates) if dates else '—'}\n"
-            f"Места: {extract_seats(text)}\n"
-            f"Цена: {extract_price(text)}\n"
-            f"Телефон: {extract_phone(text)}\n\n"
-            "📄 Исходный текст:\n" + text[:1200]
+        details = (
+            f"Маршруты:\n"
+            f"{format_route_time_pairs(parsed['routes'], parsed['times'])}\n"
+            f"Дата: {', '.join(parsed['dates']) if parsed['dates'] else '—'}\n"
+            f"Места: {parsed['seats']}\n"
+            f"Цена: {parsed['price']}\n"
+            f"Телефон: {parsed['phone']}"
         )
 
-    await update.message.reply_text(result)
+    status = "✅ Сохранено в каталог" if inserted else "♻️ Такое объявление уже есть в каталоге"
+
+    await update.message.reply_text(
+        f"{status}\n\n"
+        f"ID: #{ride_id}\n"
+        f"Тип: {parsed['kind']}\n"
+        f"{details}\n\n"
+        "Запись доступна через /search."
+    )
 
 
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("Переменная BOT_TOKEN не задана")
+
+    if not DATABASE_URL:
+        raise RuntimeError("Переменная DATABASE_URL не задана")
+
+    init_db()
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -511,7 +752,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, parse_message))
 
-    print("SNGAPP Go bot started")
+    print("SNGAPP Go bot started with PostgreSQL catalog")
     app.run_polling()
 
 
