@@ -21,6 +21,7 @@ SNGAPP_URL = "https://t.me/sngapp_bot/app"
 CITY_ALIASES = {
     "оренбург": "Оренбург", "оренбурга": "Оренбург", "оренбурге": "Оренбург",
     "орск": "Орск", "орска": "Орск", "орске": "Орск",
+    "новоорск": "Новоорск", "новоорска": "Новоорск", "новоорске": "Новоорск",
     "ясный": "Ясный", "ясного": "Ясный", "ясном": "Ясный",
     "казань": "Казань", "казани": "Казань",
     "чебоксары": "Чебоксары", "чебоксар": "Чебоксары", "чебоксарах": "Чебоксары",
@@ -352,6 +353,17 @@ def detect_type(text):
 
     driver_score = sum(x in t for x in driver_markers)
     passenger_score = sum(x in t for x in passenger_markers)
+
+    # Реальные формулировки водителей: "есть 3 места", "есть два места".
+    if re.search(r'\bесть\s+\d+\s+(?:место|места|мест)\b', t):
+        driver_score += 2
+
+    number_words_re = "|".join(NUMBER_WORDS.keys())
+    if re.search(
+        rf'\bесть\s+(?:{number_words_re})\s+(?:место|места|мест)\b',
+        t
+    ):
+        driver_score += 2
 
     if re.search(r'\bкто(?:\s+|-)?(?:нибудь\s+)?едет\b', t):
         passenger_score += 2
