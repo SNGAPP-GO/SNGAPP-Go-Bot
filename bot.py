@@ -113,13 +113,111 @@ def init_db():
                 CREATE INDEX IF NOT EXISTS rides_ride_type_idx
                 ON rides(ride_type);
             """)
+            cur.execute("ALTER TABLE rides ADD COLUMN IF NOT EXISTS source_name TEXT;")
+            cur.execute("ALTER TABLE rides ADD COLUMN IF NOT EXISTS source_username TEXT;")
+            cur.execute("ALTER TABLE rides ADD COLUMN IF NOT EXISTS source_message_id BIGINT;")
+            cur.execute("ALTER TABLE rides ADD COLUMN IF NOT EXISTS source_url TEXT;")
         conn.commit()
+
+
+
+def clean_source_name(value):
+    value = re.sub(r"\s+", " ", str(value or "")).strip()
+    return value[:200] if value else None
+
+
+def extract_message_source(message):
+    """
+    Возвращает сведения об исходном Telegram-сообщении.
+    Прямая ссылка возможна только когда Telegram отдаёт username чата
+    и ID исходного сообщения.
+    """
+    source_name = None
+    source_username = None
+    source_message_id = None
+    source_url = None
+
+    origin = getattr(message, "forward_origin", None)
+
+    if origin is not None:
+        # Канал: MessageOriginChannel -> chat + message_id.
+        chat = getattr(origin, "chat", None)
+        if chat is not None:
+            source_name = clean_source_name(
+                getattr(chat, "title", None)
+                or getattr(chat, "full_name", None)
+                or getattr(chat, "username", None)
+            )
+            source_username = getattr(chat, "username", None)
+            source_message_id = getattr(origin, "message_id", None)
+
+        # Чат/анонимный отправитель: MessageOriginChat -> sender_chat.
+        if source_name is None:
+            sender_chat = getattr(origin, "sender_chat", None)
+            if sender_chat is not None:
+                source_name = clean_source_name(
+                    getattr(sender_chat, "title", None)
+                    or getattr(sender_chat, "full_name", None)
+                    or getattr(sender_chat, "username", None)
+                )
+                source_username = getattr(sender_chat, "username", None)
+                source_message_id = getattr(origin, "message_id", None)
+
+        # Обычный пользователь.
+        if source_name is None:
+            sender_user = getattr(origin, "sender_user", None)
+            if sender_user is not None:
+                source_name = clean_source_name(
+                    getattr(sender_user, "full_name", None)
+                    or getattr(sender_user, "username", None)
+                )
+                source_username = getattr(sender_user, "username", None)
+
+        # Пользователь со скрытой пересылкой.
+        if source_name is None:
+            source_name = clean_source_name(
+                getattr(origin, "sender_user_name", None)
+            )
+
+    # Совместимость со старыми полями Telegram/PTB.
+    if source_name is None:
+        old_chat = getattr(message, "forward_from_chat", None)
+        if old_chat is not None:
+            source_name = clean_source_name(
+                getattr(old_chat, "title", None)
+                or getattr(old_chat, "full_name", None)
+                or getattr(old_chat, "username", None)
+            )
+            source_username = getattr(old_chat, "username", None)
+            source_message_id = getattr(message, "forward_from_message_id", None)
+
+    if source_name is None:
+        old_user = getattr(message, "forward_from", None)
+        if old_user is not None:
+            source_name = clean_source_name(
+                getattr(old_user, "full_name", None)
+                or getattr(old_user, "username", None)
+            )
+            source_username = getattr(old_user, "username", None)
+
+    # Ссылка на оригинальный публичный пост.
+    if source_username and source_message_id:
+        source_username = str(source_username).lstrip("@")
+        source_url = f"https://t.me/{source_username}/{int(source_message_id)}"
+
+    return {
+        "name": source_name,
+        "username": source_username,
+        "message_id": source_message_id,
+        "url": source_url,
+    }
 
 
 def save_ride(message, parsed):
     fingerprint = hashlib.sha256(
         re.sub(r"\s+", " ", parsed["raw_text"].strip().lower()).encode("utf-8")
     ).hexdigest()
+    source = extract_message_source(message)
 
     with db_connect() as conn:
         with conn.cursor() as cur:
@@ -136,11 +234,16 @@ def save_ride(message, parsed):
                     seats,
                     price,
                     phone,
-                    raw_text
+                    raw_text,
+                    source_name,
+                    source_username,
+                    source_message_id,
+                    source_url
                 )
                 VALUES (
                     %s, %s, %s, %s,
                     %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb,
+                    %s, %s, %s, %s,
                     %s, %s, %s, %s
                 )
                 ON CONFLICT (content_hash)
@@ -155,7 +258,11 @@ def save_ride(message, parsed):
                     seats = EXCLUDED.seats,
                     price = EXCLUDED.price,
                     phone = EXCLUDED.phone,
-                    raw_text = EXCLUDED.raw_text
+                    raw_text = EXCLUDED.raw_text,
+                    source_name = COALESCE(EXCLUDED.source_name, rides.source_name),
+                    source_username = COALESCE(EXCLUDED.source_username, rides.source_username),
+                    source_message_id = COALESCE(EXCLUDED.source_message_id, rides.source_message_id),
+                    source_url = COALESCE(EXCLUDED.source_url, rides.source_url)
                 RETURNING id, (xmax = 0) AS inserted;
             """, (
                 fingerprint,
@@ -170,11 +277,15 @@ def save_ride(message, parsed):
                 parsed["price"],
                 parsed["phone"],
                 parsed["raw_text"],
+                source["name"],
+                source["username"],
+                source["message_id"],
+                source["url"],
             ))
             ride_id, inserted = cur.fetchone()
         conn.commit()
 
-    return ride_id, inserted
+    return ride_id, inserted, source
 
 
 def parse_catalog_date(value, today=None):
@@ -227,7 +338,7 @@ def ride_is_active(row, today=None):
     if today is None:
         today = date.today()
 
-    ride_id, ride_type, routes, dates, times, seats, price = row
+    ride_id, ride_type, routes, dates, times, seats, price = row[:7]
 
     # Регулярные перевозчики не истекают по одной дате.
     if ride_type == "🚐 Перевозчик":
@@ -258,7 +369,7 @@ def latest_rides(limit=10):
         with conn.cursor() as cur:
             # Берём запас, потому что часть записей может оказаться просроченной.
             cur.execute("""
-                SELECT id, ride_type, routes, dates, times, seats, price
+                SELECT id, ride_type, routes, dates, times, seats, price, source_name, source_url
                 FROM rides
                 WHERE ride_type IN ('🚗 Водитель', '🚐 Перевозчик')
                 ORDER BY created_at DESC
@@ -300,7 +411,7 @@ def search_rides(query_text, limit=10):
     terms = terms[:2]
 
     sql = """
-        SELECT id, ride_type, routes, dates, times, seats, price
+        SELECT id, ride_type, routes, dates, times, seats, price, source_name, source_url
         FROM rides
         WHERE ride_type IN ('🚗 Водитель', '🚐 Перевозчик')
     """
@@ -736,7 +847,9 @@ def format_carrier_schedule(entries):
 
 
 def format_search_row(row):
-    ride_id, ride_type, routes, dates, times, seats, price = row
+    ride_id, ride_type, routes, dates, times, seats, price = row[:7]
+    source_name = row[7] if len(row) > 7 else None
+    source_url = row[8] if len(row) > 8 else None
 
     route_text = " / ".join(routes) if routes else "Маршрут не распознан"
     date_text = ", ".join(dates) if dates else "дата не указана"
@@ -752,6 +865,12 @@ def format_search_row(row):
 
     if price and price != "—":
         line += f" · Цена: {price}"
+
+    if source_name:
+        line += f"\nИсточник: {source_name}"
+
+    if source_url:
+        line += f"\nОригинал: {source_url}"
 
     return line
 
@@ -934,7 +1053,7 @@ async def parse_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        ride_id, inserted = save_ride(update.message, parsed)
+        ride_id, inserted, source = save_ride(update.message, parsed)
     except Exception as e:
         await update.message.reply_text(
             "⚠️ Текст разобран, но сохранить его в базу не удалось.\n"
@@ -966,11 +1085,18 @@ async def parse_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else "♻️ Объявление уже было в каталоге — данные обновлены"
     )
 
+    source_lines = ""
+    if source["name"]:
+        source_lines += f"\nИсточник: {source['name']}"
+    if source["url"]:
+        source_lines += f"\nОригинал: {source['url']}"
+
     await update.message.reply_text(
         f"{status}\n\n"
         f"ID: #{ride_id}\n"
         f"Тип: {parsed['kind']}\n"
-        f"{details}\n\n"
+        f"{details}"
+        f"{source_lines}\n\n"
         "Запись доступна через /search."
     )
 
